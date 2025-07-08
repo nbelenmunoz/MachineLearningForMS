@@ -6,7 +6,7 @@ import pandas as pd
 import json
 
 # 1. Configuration
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sk-p)
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 gpt_cache = {}
 MODEL = "gpt-4.1-mini"
 print(f"Using model: {MODEL}")
@@ -45,8 +45,11 @@ def gpt_vision(query='', image_path='', temperature=0.7, max_tokens=500):
 
     # For multimodal, send a single user message with a list of content blocks
     multimodal_content = [
-        {"type": "text",      "text": query},
-        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{encoded_image}"}
+        {"type": "text", "text": query},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
+        },
     ]
 
     messages = [
