@@ -1,0 +1,202 @@
+from openai import OpenAI
+import os
+import base64
+from tabulate import tabulate
+import pandas as pd
+import json
+
+# 1. Configuration
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sk-p)
+gpt_cache = {}
+MODEL = "gpt-4.1-mini"
+print(f"Using model: {MODEL}")
+
+
+def gpt_call(system_prompt, user_query, temperature=0.5, max_tokens=1000):
+    key = (MODEL, system_prompt, user_query, temperature, max_tokens)
+    if key in gpt_cache:
+        print("Cache hit for query")
+        return gpt_cache[key].choices[0].message.content
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_query}
+    ]
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    content = response.choices[0].message.content
+    gpt_cache[key] = response
+    return content
+
+
+def gpt_vision(query='', image_path='', temperature=0.7, max_tokens=500):
+    # Encode image to base64
+    with open(image_path, "rb") as image_file:
+        encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
+
+    system_prompt = (
+        "Analyze the technical drawing provided and return a complete description of the component. "
+        "Include all relevant features and dimensions, if present, in plain text suitable for machining process planning."
+    )
+
+    # For multimodal, send a single user message with a list of content blocks
+    multimodal_content = [
+        {"type": "text",      "text": query},
+        {"type": "image_url", "image_url": f"data:image/jpeg;base64,{encoded_image}"}
+    ]
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": multimodal_content}
+    ]
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens
+    )
+    return response.choices[0].message.content
+
+
+def call_process_plan(part_name, material_desc, machine, part_desc):
+    system_prompt = (
+        "You are an Expert CNC process engineer. "
+        "Interpret part descriptions, suggest machining steps, setup plans, tools, and parameters."
+    )
+    user_query = (
+        f"Part name: {part_name}. "
+        f"Raw material: {material_desc}. "
+        f"Machine: {machine}. "
+        f"Features: {part_desc}. "
+        "Please provide a brief interpretation of the part and its critical features; "
+        "A setup plan detailing how to fixture the raw material; "
+        "A process plan with steps (roughing, drilling, finishing); "
+        "For each step include: setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), remarks; "
+        "Return as JSON array of objects with keys ['step','operation','setup','tool','speed','feed','remarks']. "
+        "Also provide a draft G-code snippet for the CNC machine."
+    )
+    return gpt_call(system_prompt, user_query)
+
+
+def parse_output(raw_json):
+    try:
+        data = json.loads(raw_json)
+        return pd.DataFrame(data)
+    except json.JSONDecodeError:
+        import re
+        match = re.search(r"\[.*\]", raw_json, flags=re.S)
+        if match:
+            try:
+                return pd.DataFrame(json.loads(match.group(0)))
+            except json.JSONDecodeError:
+                pass
+        print("Error: could not parse JSON output. Raw response:")
+        print(raw_json)
+        return None
+
+
+def validate(df):
+    issues = []
+    valid_tools = [
+        'drill bit','end mill','face mill','reamer','gear cutter',
+        'hollow mill','thread mill','slab mill','fly cutter','boring tool',
+        'chamfering tool','knurling tool','parting tool','side-and-face cutter',
+        'involute gear cutter','center drill','ejector drill','twist drill','abrasive grinding wheel'
+    ]
+    for idx, row in df.iterrows():
+        speed = row.get('speed', 0)
+        tool  = str(row.get('tool','')).lower()
+        if speed and speed > 10000:
+            issues.append(f"Step {row['step']}: speed {speed} RPM exceeds 10,000 RPM.")
+        if tool and not any(v in tool for v in valid_tools):
+            issues.append(f"Step {row['step']}: unrecognized tool '{row['tool']}'.")
+    return issues
+
+
+def display(df, issues):
+    print("\n=== CNC Machining Process Plan ===")
+    for _, row in df.iterrows():
+        print(f"\nStep {row['step']}: {row['operation']}")
+        print("-"*40)
+        print(f"Setup:     {row['setup']}")
+        print(f"Tool:      {row['tool']}")
+        print(f"Speed:     {row['speed']} RPM")
+        print(f"Feed Rate: {row['feed']} mm/min")
+        if row['remarks']:
+            print(f"Remarks:   {row['remarks']}")
+    if issues:
+        print("\n=== Validation Warnings ===")
+        for issue in issues:
+            print(f"- {issue}")
+    else:
+        print("\nNo validation issues detected.")
+
+
+def summary_table(df):
+    print("\n=== Process Plan Summary Table ===")
+    table = df[['step','operation','setup','tool','speed','feed','remarks']].copy()
+    table['speed'] = table['speed'].astype(str) + " RPM"
+    table['feed']  = table['feed'].astype(str)  + " mm/min"
+    print(tabulate(table, headers='keys', tablefmt='grid', showindex=False))
+
+
+def reflect():
+    print("""
+### Reflection
+- Verify speeds/feeds against tooling specs.
+- Check critical dimensions in CAD/CAM.
+- Adapt JSON for downstream CAM import as needed.
+- Always simulate before real cuts.
+""")
+
+
+def main():
+    # --- Mode selection ---
+    print("Choose input mode:\n- [T]: Text-only prompt\n- [I]: Image + prompt for features")
+    mode = input('Type T or I: ').strip().upper()
+    part_name = input('Part name: ')
+    material_desc = input('Raw material description: ')
+    choice = input("Which machine are you planning to use?\n- [L]: CNC lathe \n- [M]: CNC milling machine\nType L or M: ").strip().upper()
+    machine = 'CNC lathe' if choice == 'L' else 'CNC milling machine'
+
+    if mode == 'I':
+        # Ask for optional prompt text first
+        query_text = input('Optional prompt text to accompany image (or leave blank): ')
+        # Try Colab-style upload, otherwise fallback to path input
+        try:
+            from google.colab import files
+            from IPython.display import Image, display
+            uploaded = files.upload()
+            image_filename = list(uploaded.keys())[0]
+            print(f"Uploaded file: {image_filename}")
+            display(Image(filename=image_filename, width=400))
+        except ImportError:
+            image_filename = input('Enter image file path (drawing/photo): ')
+
+        part_desc = gpt_vision(query_text, image_filename)
+        print(f"\nGenerated part description from image:\n{part_desc}\n")
+    else:
+        part_desc = input('Describe the part features (holes, slots, surfaces, tolerances, etc.): ')
+
+    # --- Invoke LLM for process plan ---
+    raw = call_process_plan(part_name, material_desc, machine, part_desc)
+    print("\nRaw LLM Response:\n", raw)
+
+    # --- Parse, validate, display ---
+    df = parse_output(raw)
+    if df is not None:
+        issues = validate(df)
+        display(df, issues)
+        summary_table(df)
+    else:
+        print("No valid plan generated.")
+
+    reflect()
+
+if __name__ == '__main__':
+    main()
