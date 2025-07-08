@@ -6,7 +6,7 @@ import pandas as pd
 import json
 
 
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sk-p'))
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sk-proj--jT2d3J-bs1uXNrVzuAkA'))
 
 gpt_cache = {}
 MODEL = "gpt-4.1-mini"
@@ -111,13 +111,28 @@ def validate(df):
         'involute gear cutter','center drill','ejector drill','twist drill','abrasive grinding wheel'
     ]
     for idx, row in df.iterrows():
-        speed = row.get('speed', 0)
-        tool  = str(row.get('tool','')).lower()
-        if speed and speed > 10000:
+        raw_speed = row.get('speed', 0)
+        raw_feed  = row.get('feed', 0)
+        tool      = str(row.get('tool','')).lower()
+
+        try:
+            speed = float(raw_speed)
+        except (TypeError, ValueError):
+            issues.append(f"Step {row['step']}: invalid speed value '{raw_speed}'.")
+            continue
+        try:
+            feed = float(raw_feed)
+        except (TypeError, ValueError):
+            issues.append(f"Step {row['step']}: invalid feed value '{raw_feed}'.")
+            feed = None
+
+        if speed > 10000:
             issues.append(f"Step {row['step']}: speed {speed} RPM exceeds 10,000 RPM.")
+
         if tool and not any(v in tool for v in valid_tools):
             issues.append(f"Step {row['step']}: unrecognized tool '{row['tool']}'.")
     return issues
+
 
 
 def display(df, issues):
