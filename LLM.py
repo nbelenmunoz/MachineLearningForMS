@@ -1,4 +1,5 @@
 from openai import OpenAI
+import openai
 import os
 import base64
 from tabulate import tabulate
@@ -7,6 +8,7 @@ import json
 import re
 import math
 from datetime import datetime
+import sys
 
 
 #Configuration
@@ -143,6 +145,19 @@ TOOL_DB = {
 }
 
 
+def material_selector():
+    """Prompt the user to select a material from MATERIAL_DB"""
+    materials = list(MATERIAL_DB.keys())
+    print("\nAvailable Materials:")
+    for idx, name in enumerate(materials, start=1):
+        print(f"{idx}. {name.capitalize()}")
+    choice = input("Select material (1-{}): ".format(len(materials))).strip()
+    try:
+        return materials[int(choice) - 1]
+    except (ValueError, IndexError):
+        return materials[0]
+
+
 #GPT CALLS
 def gpt_call(system_prompt, user_query, temperature=0.1, max_tokens=2000):
     key = (MODEL, system_prompt, user_query, temperature, max_tokens)
@@ -168,9 +183,9 @@ def gpt_call(system_prompt, user_query, temperature=0.1, max_tokens=2000):
 
 #IMAGE PROCESSING
 
-def gpt_image(query='', image_path='', temperature=0.1, max_tokens=3000):
-  with open(image_path, "rb") as image_file:
-      encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
+def gpt_image(query: str = "", image_path: str = "", temperature: float = 0.1, max_tokens: int = 3000):
+    with open(image_path, "rb") as image_file:
+        encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
 
     system_prompt = (
         "Analyze the technical drawing provided and return a complete description of the component. "
@@ -180,37 +195,36 @@ def gpt_image(query='', image_path='', temperature=0.1, max_tokens=3000):
         "Explicitly reference all given dimensions in the drawing. Include overall shape and principal dimensions "
         "(length, width, thickness); clearly identify and describe the location, orientation, and size of all visible features "
         "such as holes, slots, pockets, chamfers, and fillets. "
-        "State exactly on which face each feature is located (e.g., 'top face', 'side face'), using provided dimensions."
+        "State exactly on which face each feature is located (e.g., 'top face', 'side face'), using provided dimensions." \
         "If a feature is centered on a face, note that explicitly. "
         "Do not overlook any geometric dimensions in the technical drawings. Do not invent or assume features not clearly shown or dimensioned. "
         "Avoid manufacturing advice, tooling suggestions, or markup annotations. Output only the geometric description."
     )
 
+    multimodal_content = [
+        {"type": "text", "text": query},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
+        },
+    ]
 
-      multimodal_content = [
-          {"type": "text", "text": query},
-          {
-              "type": "image_url",
-              "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
-          },
-      ]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": multimodal_content}
+    ]
 
-      messages = [
-          {"role": "system", "content": system_prompt},
-          {"role": "user",   "content": multimodal_content}
-      ]
-
-      response = client.chat.completions.create(
-          model=MODEL,
-          messages=messages,
-          temperature=temperature,
-          max_tokens=max_tokens
-      )
-      return response.choices[0].message.content
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content
 
 #Text and plan process
 
-def call_process_plan(part_name, material_desc, machine, part_desc, dimensions, tolerance, surface):
+def call_process_plan(part_name, material_desc, machine, part_desc):
     system_prompt = (
         "You are an Expert CNC Process Engineer. "
         "Your role is to:\n"
@@ -230,7 +244,7 @@ def call_process_plan(part_name, material_desc, machine, part_desc, dimensions, 
         f"Part name: {part_name}. "
         f"Raw material: {material_desc}. "
         f"Machine: {machine}. "
-        f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
+        f"Features: {part_desc}. "
         "Please provide a brief interpretation of the part and its critical features; "
         "A setup plan detailing how to fixture the raw material; "
         "A process plan with steps (roughing, drilling, finishing); "
@@ -239,16 +253,16 @@ def call_process_plan(part_name, material_desc, machine, part_desc, dimensions, 
         "Also provide a draft G-code snippet for the CNC machine."
     )
 
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
+    response = client.chat.completions.create(
+        model=MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_query}
+            {"role": "user", "content": user_query},
         ],
         temperature=0.2,
-        max_tokens=2000
+        max_tokens=2000,
     )
-    return response.choices[0].message['content']
+    return response.choices[0].message.content
 
 #Json
 def parse_output(raw):
@@ -378,6 +392,18 @@ def summary_table(df):
     table['feed']  = table['feed'].astype(str)  + " mm/min"
     print(tabulate(table, headers='keys', tablefmt='grid', showindex=False))
 
+
+def display_plan(plan):
+    """Pretty-print the process plan and validation issues"""
+    df = pd.DataFrame(plan['operations'])
+    issue_rows = []
+    for step, msgs in plan.get('validation_issues', {}).items():
+        for msg in msgs:
+            issue_rows.append([step, '', msg])
+
+    display(df, issue_rows)
+    summary_table(df)
+
 def generate_gcode(plan, origin=(0, 0, 0)):
     """
     Generate complete G-code program from machining plan
@@ -432,7 +458,7 @@ def generate_gcode(plan, origin=(0, 0, 0)):
         # Tool change if needed
         if current_tool != tool_number:
             gcode.append(f"; Tool change: {tool_name} Ø{diameter}mm")
-            gcode.append(tool_data['gcode'].format(tool_number=tool_number))
+            gcode.append(tool_data['gcode_tool_change'].format(tool_number=tool_number))
             gcode.append(f"S{int(op['speed'])} M3 ; Spindle on CW")
             gcode.append(f"G43 H{tool_number} ; Tool length compensation")
             gcode.append(f"G0 Z{GCODE_CONFIG['safe_z']:.{GCODE_CONFIG['precision']}f}")
@@ -495,7 +521,7 @@ def generate_milling_path(operation, tool_diameter):
         stepover = tool_diameter * 0.6
         
         path.append("; Pocket milling operation")
-        path.append(TOOL_DB['end mill']['approach'].format(**approach_params))
+        path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
         
         # Basic pocketing pattern
         path.append(f"G1 X{width/2:.3f} Y{height/2:.3f} F{feed}")
@@ -505,14 +531,14 @@ def generate_milling_path(operation, tool_diameter):
         
     elif 'contour' in operation['operation'].lower():
         path.append("; Contour milling operation")
-        path.append(TOOL_DB['end mill']['approach'].format(**approach_params))
+        path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
         # ... (contour toolpath generation)
         path.append("; Contour toolpath would follow part geometry")
     
     else:
         warnings.append(f"Generic milling operation: {operation['operation']}")
         path.append("; Standard milling approach")
-        path.append(TOOL_DB['end mill']['approach'].format(**approach_params))
+        path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
         path.append("; Specific toolpath requires CAM software")
     
     return "\n".join(path), warnings
@@ -546,7 +572,7 @@ def generate_drilling_path(operation, tool_diameter):
             'z_approach': 5.0,
             'feed': feed
         }
-        path.append(TOOL_DB['drill bit']['approach'].format(**cycle_params))
+        path.append(TOOL_DB['drill bit']['approach_template'].format(**cycle_params))
     
     path.append("G80 ; Cancel drilling cycle")
     return "\n".join(path), warnings
@@ -603,7 +629,7 @@ def main():
     
     if input_method == "1":
         image_path = input("Image file path: ").strip()
-        part_desc = gpt_image(image_path)
+        part_desc = gpt_image(image_path=image_path)
         if not part_desc:
             print("Using fallback text description")
             part_desc = input("Describe part features: ").strip()
