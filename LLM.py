@@ -13,7 +13,6 @@ import sys
 
 
 #Configuration
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sGI3BRbukTRMGWujwbLyu_yHqkA'))
 
 MODEL = "gpt-4.1-mini"
 print(f"Using model: {MODEL}")
