@@ -11,8 +11,24 @@ from datetime import datetime
 import sys
 
 
+# build a regex for your known tool names:
+_TOOLS = sorted(TOOL_DB.keys(), key=lambda s: -len(s))
+# e.g. ['slot drill', 'face mill', 'end mill', …]
+
+# compile a giant alternation like r"(slot drill|face mill|…)"
+_TOOL_RE = re.compile(
+    rf"(?P<tool_type>{'|'.join(re.escape(t) for t in _TOOLS)})", 
+    re.IGNORECASE
+)
+
+# recognize diameter in mm:
+_DIA_RE = re.compile(r"""
+    (?P<diameter>[\d]+(?:\.\d+)?)
+    \s*(?:mm|millimeter[s]?|ø|phi)?
+""", re.IGNORECASE | re.VERBOSE)
+
 #Configuration
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sLyu_yHqkA'))
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', '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'))
 
 MODEL = "gpt-4.1-mini"
 print(f"Using model: {MODEL}")
@@ -29,7 +45,7 @@ GCODE_CONFIG = {
     'precision': 3,       # Decimal places
 }
 
-MAX_SPEED_RPM = 15_000  
+MAX_SPEED_RPM = 15_000
 # Material database with expanded parameters
 MATERIAL_DB = {
     'aluminium': {
@@ -225,6 +241,7 @@ def gpt_image(query: str = "", image_path: str = "", temperature: float = 0.1, m
 #Text and plan process
 
 def call_process_plan(part_name, material_desc, machine, part_desc):
+    """Generate machining plan with required parameters"""
     system_prompt = (
         "You are an Expert CNC Process Engineer. "
         "Your role is to:\n"
@@ -239,18 +256,21 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
         " - Highlight any safety, maintenance, or compliance issues (machine limits, tool deflection, vibrations, material hazards).\n"
         "Present your output in a clear, step-by-step format, and include any assumptions you make."
     )
+    dimensions = input("Enter critical dimensions (e.g., 100x50x25mm): ").strip()
+    tolerance = input("Specify tolerance requirements (e.g., ±0.05mm): ").strip()
+    surface = input("Surface finish requirements (e.g., Ra 3.2): ").strip()
 
     user_query = (
         f"Part name: {part_name}. "
         f"Raw material: {material_desc}. "
         f"Machine: {machine}. "
-        f"Features: {part_desc}. "
-        "Please provide a brief interpretation of the part and its critical features; "
-        "A setup plan detailing how to fixture the raw material; "
-        "A process plan with steps (roughing, drilling, finishing); "
-        "For each step include: setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), remarks; "
-        "Return as JSON array of objects with keys ['step','operation','setup','tool','speed','feed','remarks']. "
-        "Also provide a draft G-code snippet for the CNC machine."
+        f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
+        "Please provide:\n"
+        "1. Brief interpretation of the part and critical features\n"
+        "2. Setup plan (fixturing raw material)\n"
+        "3. Process plan with steps (roughing, drilling, finishing)\n"
+        "   For each step include: step, operation, setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), remarks\n"
+        "Return as JSON object with keys: 'interpretation', 'workholding', 'operations' (array of objects with keys: 'step','operation','setup','tool','speed','feed','remarks')"
     )
 
     response = client.chat.completions.create(
@@ -267,12 +287,9 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
 #Json
 def parse_output(raw):
     try:
-        # First try extracting JSON
         json_match = re.search(r'(\[{.*?}\])', raw, re.DOTALL)
         if json_match:
             return pd.DataFrame(json.loads(json_match.group(1)))
-        
-        # Fallback to direct parse
         return pd.DataFrame(json.loads(raw))
     except:
         print("JSON Parsing Failed. Raw response:")
@@ -280,89 +297,104 @@ def parse_output(raw):
         return None
 
 def calculate_parameters(material, tool_type, diameter, operation):
-    """Calculate recommended machining parameters"""
     material_data = MATERIAL_DB.get(material.lower(), {})
     tool_data = TOOL_DB.get(tool_type.lower(), {})
-    
+
     if not material_data or not tool_data:
         return None, None, None
 
     # Calculate recommended surface speed (RPM)
     sfm = material_data.get('sfm', 100)
     rpm = max(500, min(MAX_SPEED_RPM, int((sfm * 304.8) / (math.pi * diameter / 10))))
-    
+
     # Calculate recommended feed rate
     flutes = tool_data.get('flutes', 4)
     chipload = material_data['chipload'].get(
-        diameter, 
+        diameter,
         material_data['chipload'][max(material_data['chipload'].keys())]
     )
     feed = rpm * flutes * chipload
-    
+
     # Calculate depth of cut based on operation type
     if 'rough' in operation.lower():
-        depth = min(0.4 * diameter, 5.0)  
+        depth = min(0.4 * diameter, 5.0)
     elif 'finish' in operation.lower():
-        depth = min(0.1 * diameter, 1.0)  
+        depth = min(0.1 * diameter, 1.0)
     else:
-        depth = min(0.2 * diameter, 3.0)  
-    
+        depth = min(0.2 * diameter, 3.0)
+
     return rpm, feed, depth
+def parse_tool_string(s: str):
+    s = s.strip()
+    # 1) find tool type
+    m_type = _TOOL_RE.search(s)
+    # 2) find diameter
+    m_dia  = _DIA_RE.search(s)
+    if not (m_type and m_dia):
+        return None
+
+    tool_type = m_type.group('tool_type').lower()
+    diameter  = float(m_dia.group('diameter'))
+
+    # optional: look for "X-flute" or "2 flute"
+    m_flutes = re.search(r"(?P<f>\d+)\s*[- ]?flute", s, re.IGNORECASE)
+    flutes = int(m_flutes.group('f')) if m_flutes else None
+
+    # optional: coating (common coatings list)
+    m_coat = re.search(r"\b(AlTiN|TiN|TiAlN|TiCN|Diamond)\b", s, re.IGNORECASE)
+    coating = m_coat.group(1) if m_coat else None
+
+    return {
+        'tool_type': tool_type,
+        'diameter': diameter,
+        'flutes': flutes,
+        'coating': coating
+    }
 
 def validate_step(step, material):
     errors = []
-    
-    # Extract tool information
-    tool_match = re.match(r"(.+?),\s*ø\s*([\d.]+)", step['tool'])
-    if not tool_match:
-        errors.append("Invalid tool format")
-        return errors
-    
-    tool_type = tool_match.group(1).strip()
-    diameter = float(tool_match.group(2))
-    
-    # Check for known tool type
-    if tool_type.lower() not in TOOL_DB:
+
+    parsed = parse_tool_string(step['tool'])
+    if not parsed:
+        return ["Invalid tool format"]
+
+    tool_type = parsed['tool_type']
+    diameter  = parsed['diameter']
+
+    if tool_type not in TOOL_DB:
         errors.append(f"Unrecognized tool: {tool_type}")
-    
-    # Validate numerical parameters
+
+    # parse numbers
     try:
         speed = int(step['speed'])
-        feed = float(step['feed'])
+        feed  = float(step['feed'])
         depth = float(step['depth'])
-        
-        if speed <= 0 or speed > MAX_SPEED_RPM:
-            errors.append(f"Invalid RPM: {speed} (Max {MAX_SPEED_RPM})")
-        if feed <= 0:
-            errors.append(f"Invalid feed: {feed}")
-        if depth <= 0:
-            errors.append(f"Invalid depth: {depth}")
-        
-        # Depth of cut validation
-        if depth > 0.5 * diameter:
-            errors.append(f"Depth {depth}mm > 50% tool diameter")
-            
-        # Parameter recommendation check
-        rec_rpm, rec_feed, rec_depth = calculate_parameters(
-            material, tool_type, diameter, step['operation']
-        )
-        
-        if rec_rpm:
-            rpm_diff = abs(speed - rec_rpm) / rec_rpm
-            if rpm_diff > 0.3:
-                errors.append(f"RPM differs >30% from recommendation ({rec_rpm})")
-                
-            feed_diff = abs(feed - rec_feed) / rec_feed
-            if feed_diff > 0.4:
-                errors.append(f"Feed differs >40% from recommendation ({rec_feed:.1f})")
-            
-            if depth > rec_depth * 1.5:
-                errors.append(f"Depth exceeds recommendation ({rec_depth:.2f}mm)")
-                
     except (ValueError, TypeError):
         errors.append("Invalid numerical parameters")
-    
+        return errors
+
+    # basic numeric sanity
+    if not (0 < speed <= MAX_SPEED_RPM):
+        errors.append(f"Invalid RPM: {speed} (max {MAX_SPEED_RPM})")
+    if feed <= 0:
+        errors.append("Feed must be > 0")
+    if depth <= 0:
+        errors.append("Depth must be > 0")
+    if depth > TOOL_DB.get(tool_type,{}).get('max_doc', diameter*0.5):
+        errors.append(f"Depth {depth} mm > allowable DOC ({TOOL_DB[tool_type]['max_doc']} × dia)")
+
+    # parameter recommendations
+    rec_rpm, rec_feed, rec_depth = calculate_parameters(material, tool_type, diameter, step['operation'])
+    if rec_rpm:
+        if abs(speed - rec_rpm)/rec_rpm > 0.3:
+            errors.append(f"RPM off by >30% (rec {rec_rpm})")
+        if abs(feed - rec_feed)/rec_feed > 0.4:
+            errors.append(f"Feed off by >40% (rec {rec_feed:.1f})")
+        if depth > rec_depth * 1.5:
+            errors.append(f"Depth exceeds recommended ({rec_depth:.2f} mm)")
+
     return errors
+
 
 
 def display(df, issues):
@@ -394,7 +426,12 @@ def summary_table(df):
 
 
 def display_plan(plan):
-    """Pretty-print the process plan and validation issues"""
+    print("\n=== Part Interpretation ===")
+    print(plan.get('interpretation', 'No interpretation provided'))
+
+    print("\n=== Workholding Setup ===")
+    print(plan.get('workholding', 'No workholding details'))
+
     df = pd.DataFrame(plan['operations'])
     issue_rows = []
     for step, msgs in plan.get('validation_issues', {}).items():
@@ -405,15 +442,11 @@ def display_plan(plan):
     summary_table(df)
 
 def generate_gcode(plan, origin=(0, 0, 0)):
-    """
-    Generate complete G-code program from machining plan
-    Returns: (gcode_string, warnings)
-    """
     gcode = []
     warnings = []
     tool_map = {}
     current_tool = None
-    
+
     # Program header
     gcode.append(f"; CNC Program for {plan['part_name']}")
     gcode.append(f"; Material: {plan['material']}")
@@ -425,36 +458,38 @@ def generate_gcode(plan, origin=(0, 0, 0)):
     gcode.append("G49 ; Cancel tool length compensation")
     gcode.append("G80 ; Cancel canned cycles")
     gcode.append("\n")
-    
+
     # Set coordinate system
     gcode.append(f"G54 ; Work coordinate system")
     gcode.append(f"G0 Z{GCODE_CONFIG['safe_z']:.{GCODE_CONFIG['precision']}f} ; Move to safe Z")
     gcode.append("\n")
-    
+
     # Process each operation
     for i, op in enumerate(plan['operations']):
-        # Parse tool information
-        tool_match = re.match(r"(.+?),\s*ø\s*([\d.]+)", op['tool'])
-        if not tool_match:
-            warnings.append(f"Step {op['step']}: Invalid tool format '{op['tool']}'")
-            continue
-            
-        tool_name = tool_match.group(1).strip().lower()
-        diameter = float(tool_match.group(2))
-        
-        # Get tool data
-        tool_data = TOOL_DB.get(tool_name)
-        if not tool_data:
-            warnings.append(f"Step {op['step']}: Unsupported tool '{tool_name}'")
-            continue
-        
+        parsed = parse_tool_string(op['tool'])
+      if not parsed:
+          warnings.append(f"Step {op['step']}: couldn’t parse tool “{op['tool']}”")
+          continue
+
+      tool_name = parsed['tool_type']
+      diameter  = parsed['diameter']
+      # flutes/coating can be used if you want to override defaults:
+      if parsed.get('flutes'):
+          TOOL_DB[tool_name]['flutes'] = parsed['flutes']
+
+          # Get tool data
+          tool_data = TOOL_DB.get(tool_name)
+          if not tool_data:
+              warnings.append(f"Step {op['step']}: Unsupported tool '{tool_name}'")
+              continue
+
         # Assign tool number (first occurrence)
         if tool_name not in tool_map:
             tool_number = len(tool_map) + 1
             tool_map[tool_name] = tool_number
         else:
             tool_number = tool_map[tool_name]
-        
+
         # Tool change if needed
         if current_tool != tool_number:
             gcode.append(f"; Tool change: {tool_name} Ø{diameter}mm")
@@ -464,10 +499,10 @@ def generate_gcode(plan, origin=(0, 0, 0)):
             gcode.append(f"G0 Z{GCODE_CONFIG['safe_z']:.{GCODE_CONFIG['precision']}f}")
             current_tool = tool_number
             gcode.append("\n")
-        
+
         # Operation header
         gcode.append(f"; Step {op['step']}: {op['operation']}")
-        
+
         # Generate toolpath based on operation type
         op_type = tool_data['type']
         if op_type == 'milling':
@@ -481,9 +516,9 @@ def generate_gcode(plan, origin=(0, 0, 0)):
         else:
             warnings.append(f"Step {op['step']}: No path generation for {op_type} operations")
             gcode.append(f"; Manual {op_type} operation required")
-        
+
         gcode.append("\n")
-    
+
     # Program footer
     gcode.append("; Program completion")
     gcode.append("M5 ; Spindle stop")
@@ -491,19 +526,24 @@ def generate_gcode(plan, origin=(0, 0, 0)):
     gcode.append("G28 G91 Z0 ; Return to Z home")
     gcode.append("G28 G91 X0 Y0 ; Return to XY home")
     gcode.append("M30 ; Program end")
-    
+
     return "\n".join(gcode), warnings
 
 def generate_milling_path(operation, tool_diameter):
-    """Generate milling toolpath for common operations"""
+    """Generate milling toolpath for various operations with realistic patterns"""
     path = []
     warnings = []
-    
+
     # Extract parameters
-    depth = float(re.search(r"[\d.]+", str(operation['depth'])).group())
-    feed = float(re.search(r"[\d.]+", str(operation['feed'])).group())
+    depth = float(re.search(r"[\d.]+", str(operation.get('depth', 5))).group())
+    feed = float(re.search(r"[\d.]+", str(operation.get('feed', 300))).group())
     plunge_feed = feed * (GCODE_CONFIG['plunge_feed'] / 100)
-    
+
+    # Calculate max stepdown (40% of tool diameter)
+    max_stepdown = tool_diameter * 0.4
+    stepdown = min(max_stepdown, depth) if depth > max_stepdown else depth
+    passes = math.ceil(depth / stepdown) if depth > stepdown else 1
+
     # Approach parameters
     approach_params = {
         'x': 0,
@@ -513,57 +553,179 @@ def generate_milling_path(operation, tool_diameter):
         'feed': feed,
         'plunge_feed': plunge_feed
     }
-    
-    # Generate basic rectangle pocket (simplified)
-    if 'pocket' in operation['operation'].lower():
-        width = 20  # Example dimensions - should come from CAD
-        height = 30
-        stepover = tool_diameter * 0.6
-        
+
+    # Operation-specific toolpaths
+    op_type = operation['operation'].lower()
+
+    # POCKET MILLING
+    if 'pocket' in op_type:
         path.append("; Pocket milling operation")
         path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
-        
-        # Basic pocketing pattern
-        path.append(f"G1 X{width/2:.3f} Y{height/2:.3f} F{feed}")
-        path.append(f"G1 Z-{depth:.3f} F{plunge_feed}")
-        # ... (actual pocketing toolpath would go here)
-        path.append("; Pocket toolpath would be generated based on CAD geometry")
-        
-    elif 'contour' in operation['operation'].lower():
+
+        # Example pocket dimensions (should come from CAD in real implementation)
+        width = 20
+        height = 30
+        corner_radius = 2
+        stepover = tool_diameter * 0.6
+
+        path.append(f"G0 X{width/2:.3f} Y{height/2:.3f}")
+
+        for pass_num in range(passes):
+            current_depth = min(-stepdown * (pass_num + 1), -depth)
+            path.append(f"; Pass {pass_num+1}/{passes} at Z{current_depth:.3f}")
+            path.append(f"G1 Z{current_depth:.3f} F{plunge_feed}")
+
+            # Spiral pocket clearing pattern
+            offset = tool_diameter/2
+            while offset < min(width, height)/2:
+                # Move to start position
+                path.append(f"G1 X{width/2 - offset:.3f} Y{height/2 - offset:.3f} F{feed}")
+
+                # Right side
+                path.append(f"G1 X{width/2 + offset:.3f} Y{height/2 - offset:.3f}")
+                # Top side
+                path.append(f"G1 X{width/2 + offset:.3f} Y{height/2 + offset:.3f}")
+                # Left side
+                path.append(f"G1 X{width/2 - offset:.3f} Y{height/2 + offset:.3f}")
+                # Bottom side
+                path.append(f"G1 X{width/2 - offset:.3f} Y{height/2 - offset:.3f}")
+
+                offset += stepover
+
+        path.append("; Pocket completed")
+
+    # CONTOUR MILLING
+    elif 'contour' in op_type or 'profile' in op_type:
         path.append("; Contour milling operation")
         path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
-        # ... (contour toolpath generation)
-        path.append("; Contour toolpath would follow part geometry")
-    
+
+        # Example contour dimensions (should come from CAD)
+        width = 100
+        height = 80
+        corner_radius = 5
+
+        # Contour path with corner radii
+        path.append("G0 X0 Y0")
+
+        for pass_num in range(passes):
+            current_depth = min(-stepdown * (pass_num + 1), -depth)
+            path.append(f"; Pass {pass_num+1}/{passes} at Z{current_depth:.3f}")
+            path.append(f"G1 Z{current_depth:.3f} F{plunge_feed}")
+
+            # Contour path
+            path.append(f"G1 X{width-corner_radius:.3f} Y0 F{feed}")
+            path.append(f"G3 X{width:.3f} Y{corner_radius:.3f} R{corner_radius:.3f}")
+            path.append(f"G1 Y{height-corner_radius:.3f}")
+            path.append(f"G3 X{width-corner_radius:.3f} Y{height:.3f} R{corner_radius:.3f}")
+            path.append(f"G1 X{corner_radius:.3f}")
+            path.append(f"G3 X0 Y{height-corner_radius:.3f} R{corner_radius:.3f}")
+            path.append(f"G1 Y{corner_radius:.3f}")
+            path.append(f"G3 X{corner_radius:.3f} Y0 R{corner_radius:.3f}")
+
+        path.append("; Contour completed")
+
+    # FACING OPERATION
+    elif 'face' in op_type:
+        path.append("; Facing operation")
+        path.append(TOOL_DB['face mill']['approach_template'].format(**approach_params))
+
+        # Example stock dimensions
+        stock_width = 150
+        stock_length = 100
+        stepover = tool_diameter * 0.8
+
+        path.append(f"G0 X0 Y0")
+
+        for pass_num in range(passes):
+            current_depth = min(-stepdown * (pass_num + 1), -depth)
+            path.append(f"; Pass {pass_num+1}/{passes} at Z{current_depth:.3f}")
+            path.append(f"G1 Z{current_depth:.3f} F{plunge_feed}")
+
+            # Zig-zag facing pattern
+            current_y = 0
+            while current_y <= stock_length:
+                path.append(f"G1 X{stock_width:.3f} Y{current_y:.3f} F{feed}")
+                current_y += stepover
+                if current_y > stock_length:
+                    break
+                path.append(f"G1 X0 Y{current_y:.3f} F{feed}")
+                current_y += stepover
+
+        path.append("; Facing completed")
+
+    # SLOTTING OPERATION
+    elif 'slot' in op_type:
+        path.append("; Slot milling operation")
+        path.append(TOOL_DB['slot drill']['approach_template'].format(**approach_params))
+
+        # Example slot dimensions
+        slot_length = 50
+        slot_width = tool_diameter  # Slot width matches tool diameter
+
+        path.append(f"G0 X0 Y0")
+
+        for pass_num in range(passes):
+            current_depth = min(-stepdown * (pass_num + 1), -depth)
+            path.append(f"; Pass {pass_num+1}/{passes} at Z{current_depth:.3f}")
+            path.append(f"G1 Z{current_depth:.3f} F{plunge_feed}")
+
+            # Slot path with multiple passes for width
+            offset = 0
+            while offset < slot_width/2:
+                # Cut slot in both directions
+                path.append(f"G1 X{slot_length:.3f} Y{offset:.3f} F{feed}")
+                path.append(f"G1 X0 Y{offset:.3f}")
+                offset += stepover
+                if offset >= slot_width/2:
+                    break
+                path.append(f"G1 X{slot_length:.3f} Y{-offset:.3f} F{feed}")
+                path.append(f"G1 X0 Y{-offset:.3f}")
+                offset += stepover
+
+        path.append("; Slot completed")
+
+    # GENERIC MILLING OPERATION
     else:
         warnings.append(f"Generic milling operation: {operation['operation']}")
         path.append("; Standard milling approach")
         path.append(TOOL_DB['end mill']['approach_template'].format(**approach_params))
-        path.append("; Specific toolpath requires CAM software")
-    
+
+        # Add a basic square pattern as fallback
+        path.append("G0 X0 Y0")
+        path.append(f"G1 Z-{depth:.3f} F{plunge_feed}")
+        path.append(f"G1 X20 Y0 F{feed}")
+        path.append(f"G1 X20 Y20")
+        path.append(f"G1 X0 Y20")
+        path.append(f"G1 X0 Y0")
+        path.append("; Basic milling pattern completed")
+
+    # Add depth warning if needed
+    if depth > tool_diameter * 0.5:
+        warnings.append(f"Depth of cut ({depth}mm) exceeds 50% of tool diameter ({tool_diameter}mm) - consider multiple passes")
+
     return "\n".join(path), warnings
 
 def generate_drilling_path(operation, tool_diameter):
     path = []
     warnings = []
-    
+
     depth = float(re.search(r"[\d.]+", str(operation['depth'])).group())
     feed = float(re.search(r"[\d.]+", str(operation['feed'])).group())
-    
+
     hole_positions = [
         (10, 10),
         (10, 20),
         (20, 10),
         (20, 20)
     ]
-    
+
     path.append("; Drilling operation")
     path.append(f"G98 ; Return to initial Z")
-    
+
     for i, (x, y) in enumerate(hole_positions):
         path.append(f"; Hole {i+1} at X{x} Y{y}")
         path.append(f"G0 X{x} Y{y}")
-        
+
         # Drilling cycle (G81)
         cycle_params = {
             'x': x,
@@ -573,7 +735,7 @@ def generate_drilling_path(operation, tool_diameter):
             'feed': feed
         }
         path.append(TOOL_DB['drill bit']['approach_template'].format(**cycle_params))
-    
+
     path.append("G80 ; Cancel drilling cycle")
     return "\n".join(path), warnings
 
@@ -581,23 +743,23 @@ def save_gcode(gcode, filename):
     """Save G-code to file with validation"""
     if not filename.endswith('.nc'):
         filename += '.nc'
-    
+
     with open(filename, 'w') as f:
         f.write(gcode)
     print(f"G-code saved to {filename}")
-    
+
     # Basic validation
     line_count = len(gcode.split('\n'))
     tool_changes = gcode.count('M6')
     warnings = []
-    
+
     if line_count < 20:
         warnings.append(f"Short program ({line_count} lines) - verify completeness")
     if 'M30' not in gcode:
         warnings.append("Missing program end command (M30)")
     if 'G21' not in gcode:
         warnings.append("Missing metric units specification (G21)")
-    
+
     return warnings
 
 def reflect():
@@ -614,19 +776,19 @@ def main():
     print("="*60)
     part_name = input("\nPart name: ").strip()
     material = material_selector()
-    
+
     print("\nMachine Type:")
     print("1. CNC Milling Machine")
     print("2. CNC Lathe")
     print("3. 5-Axis Machining Center")
     machine_choice = input("Select machine type (1-3): ").strip()
     machine = ["CNC Milling Machine", "CNC Lathe", "5-Axis Machining Center"][int(machine_choice)-1] if machine_choice in "123" else "CNC Milling Machine"
-    
+
     print("\nInput Method:")
     print("1. Upload technical drawing (image)")
     print("2. Enter text description")
     input_method = input("Select input method (1-2): ").strip()
-    
+
     if input_method == "1":
         image_path = input("Image file path: ").strip()
         part_desc = gpt_image(image_path=image_path)
@@ -635,17 +797,17 @@ def main():
             part_desc = input("Describe part features: ").strip()
     else:
         part_desc = input("Describe part features (dimensions, holes, slots, tolerances):\n").strip()
-    
+
     print("\n Generating process plan...")
     json_plan = call_process_plan(part_name, material, machine, part_desc)
-    
+
     try:
         plan_data = json.loads(json_plan)
     except json.JSONDecodeError:
         print("Failed to parse process plan JSON")
         print("Raw response:\n", json_plan)
         return
-    
+
 
     validation_issues = {}
     for i, step in enumerate(plan_data['operations']):
@@ -662,32 +824,32 @@ def main():
         'operations': plan_data['operations'],
         'validation_issues': validation_issues
     }
-    
+
     display_plan(final_plan)
-    
+
     if final_plan['operations']:
         gen_gcode = input("\nGenerate G-code program? (y/n): ").lower()
         if gen_gcode == 'y':
             print("\n Generating G-code...")
             gcode, warnings = generate_gcode(final_plan)
-            
+
             print("\n=== G-CODE PREVIEW ===")
             print("\n".join(gcode.split('\n')[:15]) + "\n...\n")
-            
+
             if warnings:
                 print(" G-CODE GENERATION WARNINGS:")
                 for warn in warnings:
                     print(f"  - {warn}")
-            
+
             save = input("\n Save G-code to file? (y/n): ").lower()
             if save == 'y':
                 filename = f"{final_plan['part_name'].replace(' ', '_')}_program.nc"
                 save_warnings = save_gcode(gcode, filename)
-                
+
                 if save_warnings:
                     print("\n G-CODE VALIDATION NOTES:")
                     for warn in save_warnings:
                         print(f"  - {warn}")
-    
+
 if __name__ == "__main__":
     main()
