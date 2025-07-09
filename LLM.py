@@ -11,21 +11,6 @@ from datetime import datetime
 import sys
 
 
-# build a regex for your known tool names:
-_TOOLS = sorted(TOOL_DB.keys(), key=lambda s: -len(s))
-# e.g. ['slot drill', 'face mill', 'end mill', …]
-
-# compile a giant alternation like r"(slot drill|face mill|…)"
-_TOOL_RE = re.compile(
-    rf"(?P<tool_type>{'|'.join(re.escape(t) for t in _TOOLS)})", 
-    re.IGNORECASE
-)
-
-# recognize diameter in mm:
-_DIA_RE = re.compile(r"""
-    (?P<diameter>[\d]+(?:\.\d+)?)
-    \s*(?:mm|millimeter[s]?|ø|phi)?
-""", re.IGNORECASE | re.VERBOSE)
 
 #Configuration
 client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', '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'))
@@ -160,6 +145,21 @@ TOOL_DB = {
     }
 }
 
+# build a regex for your known tool names:
+_TOOLS = sorted(TOOL_DB.keys(), key=lambda s: -len(s))
+# e.g. ['slot drill', 'face mill', 'end mill', …]
+
+# compile a giant alternation like r"(slot drill|face mill|…)"
+_TOOL_RE = re.compile(
+    rf"(?P<tool_type>{'|'.join(re.escape(t) for t in _TOOLS)})", 
+    re.IGNORECASE
+)
+
+# recognize diameter in mm:
+_DIA_RE = re.compile(r"""
+    (?P<diameter>[\d]+(?:\.\d+)?)
+    \s*(?:mm|millimeter[s]?|ø|phi)?
+""", re.IGNORECASE | re.VERBOSE)
 
 def material_selector():
     """Prompt the user to select a material from MATERIAL_DB"""
@@ -246,7 +246,7 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
         "You are an Expert CNC Process Engineer. "
         "Your role is to:\n"
         " - Analyze detailed part drawings or descriptions, including geometry, tolerances, surface finish, and material.\n"
-        " - Propose an optimized sequence of machining operations (roughing, finishing, drilling, tapping, etc.) tailored to the part’s features.\n"
+        " - Propose an optimized sequence of machining operations (roughing, finishing, drilling, tapping, etc.) tailored to the part's features.\n"
         " - Specify machine setups: workholding methods, fixturing orientation, datum references, and work offsets.\n"
         " - Recommend cutting tools (end mills, drills, inserts, holders), tool materials/coatings, and toolpaths (2.5D, 3-axis, 4-axis, 5-axis).\n"
         " - Define cutting parameters: spindle speeds, feed rates, depths of cut, and coolant strategy.\n"
@@ -467,21 +467,25 @@ def generate_gcode(plan, origin=(0, 0, 0)):
     # Process each operation
     for i, op in enumerate(plan['operations']):
         parsed = parse_tool_string(op['tool'])
-      if not parsed:
-          warnings.append(f"Step {op['step']}: couldn’t parse tool “{op['tool']}”")
-          continue
+        if not parsed:
+            warnings.append(
+                f"Step {op['step']}: couldn't parse tool '{op['tool']}'"
+            )
+            continue
 
-      tool_name = parsed['tool_type']
-      diameter  = parsed['diameter']
-      # flutes/coating can be used if you want to override defaults:
-      if parsed.get('flutes'):
-          TOOL_DB[tool_name]['flutes'] = parsed['flutes']
+        tool_name = parsed['tool_type']
+        diameter = parsed['diameter']
+        # flutes/coating can be used if you want to override defaults:
+        if parsed.get('flutes'):
+            TOOL_DB[tool_name]['flutes'] = parsed['flutes']
 
-          # Get tool data
-          tool_data = TOOL_DB.get(tool_name)
-          if not tool_data:
-              warnings.append(f"Step {op['step']}: Unsupported tool '{tool_name}'")
-              continue
+        # Get tool data
+        tool_data = TOOL_DB.get(tool_name)
+        if not tool_data:
+            warnings.append(
+                f"Step {op['step']}: Unsupported tool '{tool_name}'"
+            )
+            continue
 
         # Assign tool number (first occurrence)
         if tool_name not in tool_map:
