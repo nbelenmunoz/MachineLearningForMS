@@ -258,17 +258,17 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
     tolerance = input("Specify tolerance requirements (e.g., ±0.05mm): ").strip()
     surface = input("Surface finish requirements (e.g., Ra 3.2): ").strip()
 
-user_query = (
-    f"Part name: {part_name}. "
-    f"Raw material: {material_desc}. "
-    f"Machine: {machine}. "
-    f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
-    "Please provide:\n"
-    "1. Brief interpretation of the part and critical features\n"
-    "2. Setup plan (fixturing raw material)\n"
-    "3. Process plan with steps (roughing, drilling, finishing)\n"
-    "   For each step include: step, operation, setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), depth of cut (mm), remarks\n"  # Added depth requirement
-    "Return as JSON object with keys: 'interpretation', 'workholding', 'operations' (array of objects with keys: 'step','operation','setup','tool','speed','feed','depth','remarks')"
+    user_query = (
+        f"Part name: {part_name}. "
+        f"Raw material: {material_desc}. "
+        f"Machine: {machine}. "
+        f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
+        "Please provide:\n"
+        "1. Brief interpretation of the part and critical features\n"
+        "2. Setup plan (fixturing raw material)\n"
+        "3. Process plan with steps (roughing, drilling, finishing)\n"
+        "   For each step include: step, operation, setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), depth of cut (mm), remarks\n"  # Added depth requirement
+        "Return as JSON object with keys: 'interpretation', 'workholding', 'operations' (array of objects with keys: 'step','operation','setup','tool','speed','feed','depth','remarks')"
     )
 
     response = client.chat.completions.create(
