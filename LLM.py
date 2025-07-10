@@ -10,9 +10,8 @@ import math
 from datetime import datetime
 import sys
 
-
-
 #Configuration
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY', 'sk-'))
 
 MODEL = "gpt-4.1-mini"
 print(f"Using model: {MODEL}")
@@ -150,7 +149,7 @@ _TOOLS = sorted(TOOL_DB.keys(), key=lambda s: -len(s))
 
 # compile a giant alternation like r"(slot drill|face mill|…)"
 _TOOL_RE = re.compile(
-    rf"(?P<tool_type>{'|'.join(re.escape(t) for t in _TOOLS)})", 
+    rf"(?P<tool_type>{'|'.join(re.escape(t) for t in _TOOLS)})",
     re.IGNORECASE
 )
 
@@ -248,7 +247,7 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
         " - Propose an optimized sequence of machining operations (roughing, finishing, drilling, tapping, etc.) tailored to the part's features.\n"
         " - Specify machine setups: workholding methods, fixturing orientation, datum references, and work offsets.\n"
         " - Recommend cutting tools (end mills, drills, inserts, holders), tool materials/coatings, and toolpaths (2.5D, 3-axis, 4-axis, 5-axis).\n"
-        " - Define cutting parameters: spindle speeds, feed rates, depths of cut, and coolant strategy.\n"
+        " - Define cutting parameters: spindle speeds, feed rates, depths of the tools, and coolant strategy.\n"
         " - Estimate cycle time, material removal rates, and tooling cost considerations.\n"
         " - Incorporate quality control checks: critical dimensions, inspection features, and measurement methods.\n"
         " - Advise on CAM software workflow, G-code generation, and post-processor settings.\n"
@@ -259,17 +258,17 @@ def call_process_plan(part_name, material_desc, machine, part_desc):
     tolerance = input("Specify tolerance requirements (e.g., ±0.05mm): ").strip()
     surface = input("Surface finish requirements (e.g., Ra 3.2): ").strip()
 
-    user_query = (
-        f"Part name: {part_name}. "
-        f"Raw material: {material_desc}. "
-        f"Machine: {machine}. "
-        f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
-        "Please provide:\n"
-        "1. Brief interpretation of the part and critical features\n"
-        "2. Setup plan (fixturing raw material)\n"
-        "3. Process plan with steps (roughing, drilling, finishing)\n"
-        "   For each step include: step, operation, setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), remarks\n"
-        "Return as JSON object with keys: 'interpretation', 'workholding', 'operations' (array of objects with keys: 'step','operation','setup','tool','speed','feed','remarks')"
+user_query = (
+    f"Part name: {part_name}. "
+    f"Raw material: {material_desc}. "
+    f"Machine: {machine}. "
+    f"Features: {part_desc}. Dimensions: {dimensions}. Tolerance: {tolerance}. Surface finish: {surface}. "
+    "Please provide:\n"
+    "1. Brief interpretation of the part and critical features\n"
+    "2. Setup plan (fixturing raw material)\n"
+    "3. Process plan with steps (roughing, drilling, finishing)\n"
+    "   For each step include: step, operation, setup, tool (size/type), spindle speed (RPM), feed rate (mm/min), depth of cut (mm), remarks\n"  # Added depth requirement
+    "Return as JSON object with keys: 'interpretation', 'workholding', 'operations' (array of objects with keys: 'step','operation','setup','tool','speed','feed','depth','remarks')"
     )
 
     response = client.chat.completions.create(
@@ -353,46 +352,66 @@ def parse_tool_string(s: str):
 def validate_step(step, material):
     errors = []
 
-    parsed = parse_tool_string(step['tool'])
+    # 1) Parse the tool string as before…
+    parsed = parse_tool_string(step.get('tool', ''))
     if not parsed:
-        return ["Invalid tool format"]
+        errors.append("Invalid or missing tool field")
+        return errors
 
     tool_type = parsed['tool_type']
     diameter  = parsed['diameter']
-
     if tool_type not in TOOL_DB:
         errors.append(f"Unrecognized tool: {tool_type}")
 
-    # parse numbers
-    try:
-        speed = int(step['speed'])
-        feed  = float(step['feed'])
-        depth = float(step['depth'])
-    except (ValueError, TypeError):
-        errors.append("Invalid numerical parameters")
-        return errors
+    # 2) Pull out and validate numeric fields defensively:
+    #    If any are missing, we add an explicit “missing” error.
+    speed_raw = step.get('speed')
+    feed_raw  = step.get('feed')
+    depth_raw = step.get('depth')
 
-    # basic numeric sanity
-    if not (0 < speed <= MAX_SPEED_RPM):
-        errors.append(f"Invalid RPM: {speed} (max {MAX_SPEED_RPM})")
-    if feed <= 0:
-        errors.append("Feed must be > 0")
-    if depth <= 0:
-        errors.append("Depth must be > 0")
-    if depth > TOOL_DB.get(tool_type,{}).get('max_doc', diameter*0.5):
-        errors.append(f"Depth {depth} mm > allowable DOC ({TOOL_DB[tool_type]['max_doc']} × dia)")
+    if speed_raw is None:
+        errors.append("Missing field: speed")
+    if feed_raw is None:
+        errors.append("Missing field: feed")
+    if depth_raw is None:
+        errors.append("Missing field: depth")
 
-    # parameter recommendations
-    rec_rpm, rec_feed, rec_depth = calculate_parameters(material, tool_type, diameter, step['operation'])
-    if rec_rpm:
-        if abs(speed - rec_rpm)/rec_rpm > 0.3:
-            errors.append(f"RPM off by >30% (rec {rec_rpm})")
-        if abs(feed - rec_feed)/rec_feed > 0.4:
-            errors.append(f"Feed off by >40% (rec {rec_feed:.1f})")
-        if depth > rec_depth * 1.5:
-            errors.append(f"Depth exceeds recommended ({rec_depth:.2f} mm)")
+    # 3) Only if all are present do we try to parse them:
+    if speed_raw is not None and feed_raw is not None and depth_raw is not None:
+        try:
+            speed = int(speed_raw)
+            feed  = float(feed_raw)
+            depth = float(depth_raw)
+        except (ValueError, TypeError):
+            errors.append("Speed, feed or depth not valid numbers")
+            return errors
+
+        # 4) The rest of your numeric checks:
+        if not (0 < speed <= MAX_SPEED_RPM):
+            errors.append(f"Invalid RPM: {speed} (max {MAX_SPEED_RPM})")
+        if feed <= 0:
+            errors.append("Feed must be > 0")
+        if depth <= 0:
+            errors.append("Depth must be > 0")
+        # Check against tool’s max_doc:
+        max_doc = TOOL_DB[tool_type]['max_doc'] * diameter
+        if depth > max_doc:
+            errors.append(f"Depth {depth}mm > allowable DOC ({max_doc:.2f}mm)")
+
+        # 5) Optional: compare to recommended parameters
+        rec_rpm, rec_feed, rec_depth = calculate_parameters(
+            material, tool_type, diameter, step.get('operation','')
+        )
+        if rec_rpm:
+            if abs(speed - rec_rpm)/rec_rpm > 0.3:
+                errors.append(f"RPM off by >30% (rec {rec_rpm})")
+            if abs(feed - rec_feed)/rec_feed > 0.4:
+                errors.append(f"Feed off by >40% (rec {rec_feed:.1f})")
+            if depth > rec_depth * 1.5:
+                errors.append(f"Depth exceeds recommended ({rec_depth:.2f}mm)")
 
     return errors
+
 
 
 
@@ -672,6 +691,7 @@ def generate_milling_path(operation, tool_diameter):
             path.append(f"; Pass {pass_num+1}/{passes} at Z{current_depth:.3f}")
             path.append(f"G1 Z{current_depth:.3f} F{plunge_feed}")
 
+            stepover = tool_diameter * 0.5
             # Slot path with multiple passes for width
             offset = 0
             while offset < slot_width/2:
